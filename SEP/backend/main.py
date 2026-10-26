@@ -1,0 +1,468 @@
+from contextlib import asynccontextmanager
+import json
+import logging
+from pathlib import Path
+import sys
+import time
+from datetime import datetime
+from typing import Any
+import uuid
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from ai.models.model_registry import WORKLOAD_PROFILES
+from config import settings
+from database import engine
+from ml.nlp_pipeline import load_nlp_models
+from models.models import Base
+from routers import (
+    admin_content,
+    admin_questions,
+    ai,
+    analysis,
+    auth,
+    content,
+    exams,
+    feedback,
+    planner,
+    pyq,
+    quiz,
+    roadmap,
+    revision,
+    scraper,
+    study_chat,
+    syllabus,
+    uploads,
+)
+
+
+from ml.weakness_detector import WeaknessDetector
+from services.ai_service import provider_readiness, provider_status
+
+weakness_detector: WeaknessDetector | None = None
+logger = logging.getLogger(__name__)
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+nlp_readiness: dict[str, Any] = {
+    "loaded": False,
+    "degraded_mode": True,
+    "reason": "startup_not_run",
+}
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global weakness_detector
+    
+    # Ensure core tables exist for local/dev bootstrapping.
+    Base.metadata.create_all(bind=engine)
+
+    # Ensure upload directories exist on startup.
+    upload_root = Path(settings.upload_dir)
+    (upload_root / "syllabi").mkdir(parents=True, exist_ok=True)
+    (upload_root / "student-materials").mkdir(parents=True, exist_ok=True)
+
+    # Warm NLP singletons once at startup for low-latency first use.
+    try:
+        load_nlp_models()
+        nlp_readiness.update(
+            {
+                "loaded": True,
+                "degraded_mode": False,
+                "reason": "models_loaded",
+            }
+        )
+        print("[ok] NLP models loaded (spaCy + sentence-transformers)")
+    except Exception as exc:
+        nlp_readiness.update(
+            {
+                "loaded": False,
+                "degraded_mode": True,
+                "reason": "model_load_failed",
+                "error": str(exc),
+            }
+        )
+        logger.exception("NLP startup failed; continuing in degraded mode")
+        print("[warn] NLP model load failed; running in degraded mode", file=sys.stderr)
+        
+    weakness_detector = WeaknessDetector(use_ml_model=True)
+    print("[ok] WeaknessDetector loaded")
+
+    ai_status = provider_status()
+    provider_summary = ", ".join(
+        f"{provider}={'on' if enabled else 'off'}"
+        for provider, enabled in ai_status.items()
+    )
+    print(f"[ok] AI providers: {provider_summary}")
+    print(f"[ok] Configured workloads: {', '.join(w.value for w in WORKLOAD_PROFILES.keys())}")
+
+    yield
+
+
+def _mock_from_schema(
+    schema: dict[str, Any],
+    components: dict[str, dict[str, Any]],
+    seen: set[str] | None = None,
+) -> Any:
+    seen = seen or set()
+
+    if "example" in schema:
+        return schema["example"]
+
+    if "examples" in schema and isinstance(schema["examples"], dict):
+        for example_value in schema["examples"].values():
+            if isinstance(example_value, dict) and "value" in example_value:
+                return example_value["value"]
+            return example_value
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str):
+        ref_name = ref.split("/")[-1]
+        if ref_name in seen:
+            return {}
+        resolved = components.get(ref_name, {})
+        return _mock_from_schema(resolved, components, seen | {ref_name})
+
+    if "allOf" in schema:
+        merged: dict[str, Any] = {}
+        for item in schema.get("allOf", []):
+            value = _mock_from_schema(item, components, seen)
+            if isinstance(value, dict):
+                merged.update(value)
+        return merged
+
+    if "oneOf" in schema and schema["oneOf"]:
+        return _mock_from_schema(schema["oneOf"][0], components, seen)
+
+    if "anyOf" in schema and schema["anyOf"]:
+        return _mock_from_schema(schema["anyOf"][0], components, seen)
+
+    if "enum" in schema and schema["enum"]:
+        return schema["enum"][0]
+
+    if "const" in schema:
+        return schema["const"]
+
+    if "default" in schema:
+        return schema["default"]
+
+    schema_type = schema.get("type")
+    if not schema_type:
+        if "properties" in schema:
+            schema_type = "object"
+        elif "items" in schema:
+            schema_type = "array"
+
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        result: dict[str, Any] = {}
+        for prop_name, prop_schema in properties.items():
+            if isinstance(prop_schema, dict):
+                result[prop_name] = _mock_from_schema(prop_schema, components, seen)
+        return result
+
+    if schema_type == "array":
+        items = schema.get("items", {})
+        if isinstance(items, dict):
+            return [_mock_from_schema(items, components, seen)]
+        return []
+
+    if schema_type == "string":
+        fmt = schema.get("format")
+        if fmt == "email":
+            return "student@example.com"
+        if fmt == "uuid":
+            return "3f54d88f-6342-421b-b2f8-2755ee9f66c7"
+        if fmt == "date-time":
+            return "2026-04-02T12:00:00Z"
+        if fmt == "date":
+            return "2026-04-02"
+        if fmt in {"uri", "url"}:
+            return "https://example.com"
+
+        min_length = schema.get("minLength")
+        if isinstance(min_length, int) and min_length > 0:
+            return "x" * min_length
+        return "string"
+
+    if schema_type == "integer":
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)):
+            return int(minimum)
+        return 1
+
+    if schema_type == "number":
+        minimum = schema.get("minimum")
+        if isinstance(minimum, (int, float)):
+            return float(minimum)
+        return 1.0
+
+    if schema_type == "boolean":
+        return True
+
+    return "value"
+
+
+def _inject_openapi_examples(openapi_schema: dict[str, Any]) -> None:
+    components = openapi_schema.get("components", {}).get("schemas", {})
+
+    if isinstance(components, dict):
+        for schema in components.values():
+            if not isinstance(schema, dict):
+                continue
+            if "example" in schema or "examples" in schema:
+                continue
+            schema["example"] = _mock_from_schema(schema, components)
+
+    paths = openapi_schema.get("paths", {})
+    if not isinstance(paths, dict):
+        return
+
+    for path_item in paths.values():
+        if not isinstance(path_item, dict):
+            continue
+
+        for method, operation in path_item.items():
+            if method not in {
+                "get",
+                "post",
+                "put",
+                "patch",
+                "delete",
+                "options",
+                "head",
+            }:
+                continue
+            if not isinstance(operation, dict):
+                continue
+
+            request_body = operation.get("requestBody", {})
+            if not isinstance(request_body, dict):
+                continue
+
+            content = request_body.get("content", {})
+            if not isinstance(content, dict):
+                continue
+
+            for media_type in content.values():
+                if not isinstance(media_type, dict):
+                    continue
+                if "example" in media_type or "examples" in media_type:
+                    continue
+
+                body_schema = media_type.get("schema")
+                if isinstance(body_schema, dict):
+                    media_type["example"] = _mock_from_schema(body_schema, components)
+
+
+app = FastAPI(
+    title="SmartExamPrep API",
+    description="Backend API for SmartExamPrep MVP",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    swagger_ui_parameters={
+        "displayRequestDuration": True,
+        "tryItOutEnabled": True,
+        "persistAuthorization": True,
+    },
+)
+
+
+def custom_openapi() -> dict[str, Any]:
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    _inject_openapi_examples(openapi_schema)
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def log_request_middleware(request: Request, call_next):
+    status_code = 500
+    request_id = request.headers.get("X-Request-Id") or uuid.uuid4().hex
+    request.state.request_id = request_id
+    started_at = time.perf_counter()
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-Id"] = request_id
+        return response
+    finally:
+        duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        logger.info(
+            json.dumps(
+                {
+                    "event": "http_request_completed",
+                    "request_id": request_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                }
+            )
+        )
+
+
+def _request_id_from_request(request: Request) -> str:
+    return getattr(request.state, "request_id", "unknown")
+
+
+def _http_error_payload(
+    *,
+    request: Request,
+    status_code: int,
+    detail: Any,
+    default_message: str,
+) -> dict[str, Any]:
+    request_id = _request_id_from_request(request)
+    payload: dict[str, Any] = {
+        "detail": default_message,
+        "status_code": status_code,
+        "request_id": request_id,
+    }
+
+    if isinstance(detail, str) and detail.strip():
+        payload["detail"] = detail
+        return payload
+
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message.strip():
+            payload["detail"] = message
+
+        errors = detail.get("errors")
+        if isinstance(errors, list):
+            payload["errors"] = errors
+
+        missing_profile_fields = detail.get("missing_profile_fields")
+        if isinstance(missing_profile_fields, list):
+            payload["missing_profile_fields"] = missing_profile_fields
+
+    return payload
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    request_id = _request_id_from_request(request)
+    return JSONResponse(
+        status_code=exc.status_code,
+        headers={"X-Request-Id": request_id},
+        content=_http_error_payload(
+            request=request,
+            status_code=exc.status_code,
+            detail=exc.detail,
+            default_message="Request failed.",
+        ),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors: list[dict[str, str]] = []
+
+    for validation_error in exc.errors():
+        loc = [str(part) for part in validation_error.get("loc", [])]
+        # Remove transport prefixes so the field is clean in frontend toasts/forms.
+        loc = [part for part in loc if part not in {"body", "query", "path", "header", "cookie"}]
+        field = ".".join(loc) if loc else "body"
+
+        errors.append(
+            {
+                "field": field,
+                "message": str(validation_error.get("msg", "Invalid value")),
+            }
+        )
+
+    request_id = _request_id_from_request(request)
+    return JSONResponse(
+        status_code=422,
+        headers={"X-Request-Id": request_id},
+        content={
+            "detail": "Validation error",
+            "errors": errors,
+            "request_id": request_id,
+            "status_code": 422,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    request_id = _request_id_from_request(request)
+    logger.exception(
+        json.dumps(
+            {
+                "event": "http_request_failed",
+                "request_id": request_id,
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": 500,
+                "error": str(exc),
+            }
+        )
+    )
+    return JSONResponse(
+        status_code=500,
+        headers={"X-Request-Id": request_id},
+        content={
+            "detail": "Internal server error. Please try again.",
+            "request_id": request_id,
+            "status_code": 500,
+        },
+    )
+
+
+@app.get("/health", tags=["System"])
+def health_check() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "server_time_utc": datetime.utcnow().isoformat() + "Z",
+        "readiness": {
+            "nlp": dict(nlp_readiness),
+            "ai": provider_readiness(),
+        },
+    }
+
+
+app.include_router(auth.router, prefix="/api/auth", tags=["Auth"])
+app.include_router(quiz.router, prefix="/api/quiz", tags=["Quiz"])
+app.include_router(pyq.router, prefix="/api/pyq", tags=["PYQ"])
+app.include_router(analysis.router, prefix="/api/analysis", tags=["Analysis"])
+app.include_router(revision.router, prefix="/api/revision", tags=["Revision"])
+app.include_router(content.router, prefix="/api/content", tags=["Content"])
+app.include_router(exams.router, prefix="/api/exams", tags=["Exams"])
+app.include_router(roadmap.router, prefix="/api/roadmap", tags=["Roadmap"])
+app.include_router(planner.router, prefix="/api/planner", tags=["Planner"])
+app.include_router(study_chat.router, prefix="/api/study-chat", tags=["Study Chat"])
+app.include_router(ai.router, prefix="/api/ai", tags=["AI"])
+app.include_router(feedback.router, prefix="/api/feedback", tags=["Feedback"])
+app.include_router(uploads.router, prefix="/api/uploads", tags=["Uploads"])
+app.include_router(admin_content.router, prefix="/api/admin/content", tags=["Admin Content"])
+app.include_router(admin_questions.router, prefix="/api/admin/questions", tags=["Admin Questions"])
+app.include_router(scraper.router, prefix="/api/admin/scraper", tags=["Admin Scraper"])
+app.include_router(syllabus.router, prefix="/api/admin/syllabus", tags=["Admin Syllabus"])
